@@ -36,12 +36,10 @@ cp .env.example .env
 
 | Variable | Description |
 |----------|-------------|
-| `DOCKET_BASE_URL` | Docket app URL (default: `https://app.docketqa.com`) |
-| `DOCKET_API_KEY` | Your Docket API key |
+| `DOCKET_BASE_URL` | [HTTP API](https://docs.docketqa.com/api-reference/introduction) base (default: `https://api.docketqa.com` — not the `app` web origin) |
+| `DOCKET_API_KEY` | API key from **Dashboard → CI/CD** |
 
-Get the API key from the Docket web app: **Dashboard → CI/CD** (not the general Settings webhook secret). See [Docket CI integration](https://docs.docketqa.com/essentials/ci-integration) and the [API reference](https://docs.docketqa.com/api-reference/introduction).
-
-If requests return `401`, confirm in Docket’s docs whether your plan expects `Authorization: Bearer` or another header (e.g. `X-API-KEY`) and adjust `index.ts` if needed.
+The server sends `X-API-KEY` to `api.docketqa.com` as in the [API introduction](https://docs.docketqa.com/api-reference/introduction). `get_test_case` uses `POST /test_group_run/trigger_run` and **starts a run**; use that response or `get_test_results` with `GET /test_run/{id}`.
 
 ## Run
 
@@ -50,6 +48,43 @@ npm start
 ```
 
 The server listens on **http://localhost:3333** by default.
+
+## Sample MCP usage
+
+In Cursor (or any MCP client connected to this server), you ask in plain language; the assistant maps your request to the tools below.
+
+| What you want | Tool | Typical arguments |
+|----------------|------|---------------------|
+| Load the latest blueprint snapshot for a test (starts a run on Docket) | `get_test_case` | `testId`: blueprint id as a string, e.g. `"2734"` |
+| Merge new fields into one step (then apply in the Docket editor if needed) | `update_test_step` | `testId`, `stepId` (step number or internal step id), `payload`: partial step object |
+| Run every test in a suite | `run_test_suite` | `suiteId`: test suite / category id from Docket |
+| Poll one test run | `get_test_results` | `runId`: from `trigger_run` → `test_runs[].id` |
+
+### Example: “Update step 12 of test 2734 to fix action issue”
+
+1. Use **`update_test_step`** with the blueprint id, step number, and the fields you want to change (for example, switch a flaky recorded click to an AI step with clearer text):
+
+   ```json
+   {
+     "testId": "2734",
+     "stepId": "12",
+     "payload": {
+       "type": "act",
+       "action": "In the manual control alerts table, click the row for the system under test.",
+       "action_cache": null
+     }
+   }
+   ```
+
+2. The tool returns a **`merged_step`** JSON object. If your Docket tier does not expose a public “save step” API, open the test in [app.docketqa.com](https://app.docketqa.com), edit step 12, and paste or mirror those fields.
+
+### Example: “Show me test 2734’s steps”
+
+Use **`get_test_case`** with `testId` **`"2734"`**. This triggers a run and returns `blueprint_metadata.steps` in the response—use sparingly on busy suites.
+
+### Example: “How did run 43376 go?”
+
+Use **`get_test_results`** with `runId` **`"43376"`** (use an id returned from `get_test_case` / `trigger_run`).
 
 ## HTTP API
 

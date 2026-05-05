@@ -11,11 +11,18 @@ import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js
 
 dotenv.config();
 
+/** Official HTTP API host — not the web app (`app.docketqa.com`). See https://docs.docketqa.com/api-reference/introduction */
+const DEFAULT_DOCKET_API = "https://api.docketqa.com";
+
 function createApi(): AxiosInstance {
+  const key = process.env.DOCKET_API_KEY;
+  if (!key) {
+    console.warn("Warning: DOCKET_API_KEY is not set.");
+  }
   return axios.create({
-    baseURL: process.env.DOCKET_BASE_URL,
+    baseURL: process.env.DOCKET_BASE_URL?.trim() || DEFAULT_DOCKET_API,
     headers: {
-      Authorization: `Bearer ${process.env.DOCKET_API_KEY}`,
+      "X-API-KEY": key ?? "",
       "Content-Type": "application/json",
     },
   });
@@ -39,16 +46,23 @@ function getServer(): McpServer {
     { name: "docket-mcp", version: "1.0.0" },
     {
       instructions:
-        "Docket QA: use these tools to read/update tests and steps, run suites, and fetch run results. Server must have DOCKET_BASE_URL and DOCKET_API_KEY set.",
+        "Docket QA HTTP API (api.docketqa.com): X-API-KEY auth. get_test_case triggers a run and returns blueprint snapshots (see response). run_test_suite uses test_group_run/trigger_run with suite id. get_test_results uses GET test_run/{id}. Updating blueprint steps is not exposed as a simple PATCH in public docs—update_test_step merges your payload onto the current step and returns JSON to apply in the Docket UI if the API rejects save.",
     }
   );
 
   server.registerTool(
     "get_test_case",
-    { description: "Fetch a Docket test by id", inputSchema: { testId: z.string() } },
+    {
+      description:
+        "Fetch blueprint snapshot(s) by triggering a run for the given test blueprint id(s). Note: this starts a real test run on Docket.",
+      inputSchema: { testId: z.string() },
+    },
     async ({ testId }) => {
       try {
-        const { data } = await api.get(`/api/tests/${testId}`);
+        const id = Number(testId);
+        const { data } = await api.post("/test_group_run/trigger_run", {
+          test_blueprint_ids: [id],
+        });
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       } catch (e) {
         return toolErr(e);
@@ -59,7 +73,8 @@ function getServer(): McpServer {
   server.registerTool(
     "update_test_step",
     {
-      description: "Patch a step on a Docket test",
+      description:
+        "Merge fields into a step (match by step_number or internal step id). Fetches current steps via trigger_run, applies payload, returns merged step. The public API may not persist changes automatically—apply the returned step in the Docket test editor if save fails.",
       inputSchema: {
         testId: z.string(),
         stepId: z.string(),
@@ -68,8 +83,32 @@ function getServer(): McpServer {
     },
     async ({ testId, stepId, payload }) => {
       try {
-        const { data } = await api.patch(`/api/tests/${testId}/steps/${stepId}`, payload);
-        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+        const tid = Number(testId);
+        const sid = Number(stepId);
+        const { data: trig } = await api.post("/test_group_run/trigger_run", {
+          test_blueprint_ids: [tid],
+        });
+        const steps = trig?.test_group_run?.test_runs?.[0]?.blueprint_metadata?.steps as
+          | Record<string, unknown>[]
+          | undefined;
+        if (!steps?.length) {
+          return toolErr(new Error("No steps in trigger_run response"));
+        }
+        const idx = steps.findIndex(
+          (s) => s.step_number === sid || s.id === sid || String(s.step_number) === stepId
+        );
+        if (idx === -1) {
+          return toolErr(new Error(`No step matching stepId/step_number ${stepId}`));
+        }
+        const merged = { ...steps[idx], ...payload };
+        const out = {
+          message:
+            "Merged step (not saved via API unless Docket exposes an update endpoint). Copy into the test editor for this blueprint if needed.",
+          test_blueprint_id: tid,
+          step_index: idx,
+          merged_step: merged,
+        };
+        return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
       } catch (e) {
         return toolErr(e);
       }
@@ -79,28 +118,41 @@ function getServer(): McpServer {
   server.registerTool(
     "update_test_case",
     {
-      description: "Patch a Docket test",
+      description:
+        "Public docs list create test (POST test_blueprint/create) but not a general PATCH for arbitrary fields. Use the Docket dashboard or contact Docket for programmatic updates.",
       inputSchema: {
         testId: z.string(),
         payload: z.record(z.string(), z.unknown()),
       },
     },
-    async ({ testId, payload }) => {
-      try {
-        const { data } = await api.patch(`/api/tests/${testId}`, payload);
-        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-      } catch (e) {
-        return toolErr(e);
-      }
+    async () => {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              error:
+                "No supported public endpoint for arbitrary test PATCH in this MCP server. Use the Docket app or check docs for your contract tier.",
+            }),
+          },
+        ],
+        isError: true,
+      };
     }
   );
 
   server.registerTool(
     "run_test_suite",
-    { description: "Run a Docket test suite", inputSchema: { suiteId: z.string() } },
+    {
+      description:
+        "Trigger all tests in a suite (test blueprint category). Pass the suite/category id from the Docket URL.",
+      inputSchema: { suiteId: z.string() },
+    },
     async ({ suiteId }) => {
       try {
-        const { data } = await api.post(`/api/suites/${suiteId}/run`);
+        const { data } = await api.post("/test_group_run/trigger_run", {
+          test_blueprint_category_id: suiteId,
+        });
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       } catch (e) {
         return toolErr(e);
@@ -110,10 +162,13 @@ function getServer(): McpServer {
 
   server.registerTool(
     "get_test_results",
-    { description: "Fetch results for a Docket run", inputSchema: { runId: z.string() } },
+    {
+      description: "Fetch one test run by id (GET test_run/{runId}). Use the id from trigger_run → test_runs[].id.",
+      inputSchema: { runId: z.string() },
+    },
     async ({ runId }) => {
       try {
-        const { data } = await api.get(`/api/runs/${runId}`);
+        const { data } = await api.get(`/test_run/${runId}`);
         return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
       } catch (e) {
         return toolErr(e);
@@ -225,7 +280,9 @@ app.post("/messages", async (req, res) => {
 app.post("/get_test_case", async (req, res) => {
   try {
     const { testId } = req.body;
-    const { data } = await api.get(`/api/tests/${testId}`);
+    const { data } = await api.post("/test_group_run/trigger_run", {
+      test_blueprint_ids: [Number(testId)],
+    });
     res.json(data);
   } catch (err: unknown) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -235,27 +292,49 @@ app.post("/get_test_case", async (req, res) => {
 app.post("/update_test_step", async (req, res) => {
   try {
     const { testId, stepId, payload } = req.body;
-    const { data } = await api.patch(`/api/tests/${testId}/steps/${stepId}`, payload);
-    res.json(data);
+    const tid = Number(testId);
+    const sid = Number(stepId);
+    const { data: trig } = await api.post("/test_group_run/trigger_run", {
+      test_blueprint_ids: [tid],
+    });
+    const steps = trig?.test_group_run?.test_runs?.[0]?.blueprint_metadata?.steps as
+      | Record<string, unknown>[]
+      | undefined;
+    if (!steps?.length) {
+      res.status(400).json({ error: "No steps in trigger response" });
+      return;
+    }
+    const idx = steps.findIndex(
+      (s) => s.step_number === sid || s.id === sid || String(s.step_number) === String(stepId)
+    );
+    if (idx === -1) {
+      res.status(404).json({ error: `No step matching ${stepId}` });
+      return;
+    }
+    res.json({
+      message:
+        "Merged locally; apply in Docket UI if your tier has no blueprint PATCH endpoint.",
+      test_blueprint_id: tid,
+      merged_step: { ...steps[idx], ...payload },
+    });
   } catch (err: unknown) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
 
-app.post("/update_test_case", async (req, res) => {
-  try {
-    const { testId, payload } = req.body;
-    const { data } = await api.patch(`/api/tests/${testId}`, payload);
-    res.json(data);
-  } catch (err: unknown) {
-    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-  }
+app.post("/update_test_case", async (_req, res) => {
+  res.status(501).json({
+    error:
+      "Not implemented against public api.docketqa.com — use Docket dashboard or documented create/update endpoints.",
+  });
 });
 
 app.post("/run_test_suite", async (req, res) => {
   try {
     const { suiteId } = req.body;
-    const { data } = await api.post(`/api/suites/${suiteId}/run`);
+    const { data } = await api.post("/test_group_run/trigger_run", {
+      test_blueprint_category_id: String(suiteId),
+    });
     res.json(data);
   } catch (err: unknown) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -265,7 +344,7 @@ app.post("/run_test_suite", async (req, res) => {
 app.post("/get_test_results", async (req, res) => {
   try {
     const { runId } = req.body;
-    const { data } = await api.get(`/api/runs/${runId}`);
+    const { data } = await api.get(`/test_run/${runId}`);
     res.json(data);
   } catch (err: unknown) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
